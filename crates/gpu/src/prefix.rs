@@ -8,11 +8,29 @@
 //! capture merges into the chunk it overlaps, so every hit lands on the same stable entry.
 use std::collections::HashMap;
 
-use photocraft_doc::{Document, Layer};
+use photocraft_doc::{Document, Layer, LayerContent, LayerMask, VectorMask, Effects, AdvancedBlending, BlendIf, Locks};
 use photocraft_geom::Rect;
 
 use crate::Tex;
 use crate::plan::{Checkpoint, Plan};
+
+/// Compare two layers by their pixel-content identity (ignoring compositing properties).
+/// Returns true if the layers would produce identical pixel output when composited with
+/// the same backdrop. Used by the prefix cache to find valid checkpoints when only
+/// compositing properties (opacity, fill, blend, visible, etc.) change.
+fn layers_pixel_equal(a: &Layer, b: &Layer) -> bool {
+    a.id == b.id
+        && a.content == b.content
+        && a.mask == b.mask
+        && a.vector_mask == b.vector_mask
+        && a.effects == b.effects
+        && a.clipped == b.clipped
+        && a.excluded_channels == b.excluded_channels
+        && a.blend_if == b.blend_if
+        && a.advanced == b.advanced
+        // Note: locks.transparency/position don't affect pixel output.
+        // visible, opacity, fill_opacity, blend, name, label, psd_blocks, etc. are compositing properties.
+}
 
 pub(crate) const MAX_BYTES: u64 = 512 << 20;
 
@@ -99,7 +117,23 @@ impl Prefix {
         let mut context = doc.clone();
         let mut layers = std::mem::take(&mut context.layers);
         let same_context = self.context.as_ref() == Some(&context);
-        let changed = self.layers.iter().zip(&layers).position(|(a, b)| a != b).or_else(|| (layers.len() < self.layers.len()).then_some(layers.len()));
+
+        // Find first layer where PIXEL CONTENT changed (content, mask, effects, etc.).
+        let pixel_changed = self.layers.iter().zip(&layers).position(|(a, b)| !layers_pixel_equal(a, b))
+            .or_else(|| (layers.len() < self.layers.len()).then_some(layers.len()));
+        // Find first layer where ANY property changed (including compositing: opacity, fill, blend, visible).
+        let any_changed = self.layers.iter().zip(&layers).position(|(a, b)| a != b)
+            .or_else(|| (layers.len() < self.layers.len()).then_some(layers.len()));
+
+        // The prefix captures layers 0..layer_end-1. Both pixel and compositing changes on layer N
+        // require layer_end <= N. Use the earliest change.
+        let changed = match (pixel_changed, any_changed) {
+            (Some(p), Some(a)) => Some(p.min(a)),
+            (Some(p), None) => Some(p),
+            (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+
         let old = self.checkpoint.filter(|c| same_context && changed.is_none() && plan.checkpoints.contains(c));
         let checkpoint = old.or_else(|| {
             if same_context && let Some(changed) = changed {
