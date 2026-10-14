@@ -287,6 +287,9 @@ struct ProgState {
 struct FxEntry {
     doc: DocId,
     region: Rect,
+    /// Layer's pixel bounds (content bounds + effects margin): used to detect pure translation
+    /// of the layer so effect maps can be translated instead of rebuilt.
+    bounds: Rect,
     shape_key: u64,
     /// Tiles the shape was rendered from (content, mask): damage is their difference.
     tiles: [Option<fx::Tiles>; 2],
@@ -1648,6 +1651,13 @@ impl Compositor {
         let frame = self.frame;
         let (rw, rh) = (region.width(), region.height());
 
+        // Layer's pixel bounds (content + effects margin): used to detect pure translation.
+        let layer_bounds = if is_group {
+            f.region
+        } else {
+            bounds::layer_bounds(layer, canvas).inflate(photocraft_compose::effects::margin(layer))
+        };
+
         // What changed: everything (new settings / size), the position only, some tiles, or
         // nothing.
         let mut damage = Rect::EMPTY;
@@ -1671,14 +1681,44 @@ impl Compositor {
             && (old.width(), old.height()) == (rw, rh)
             && !region.is_empty()
         {
-            // Moved by whole pixels: maps are computed relative to the region, so if the shape
-            // moved unchanged with it, every map is still exact.
-            let v = fx::shape(doc, layer, region);
-            if let Some(e) = self.fx.get_mut(&key)
-                && v == e.shape_cpu
+            // Check for pure translation: same shape_key, same size, layer bounds translated
+            // by whole pixels, and tile pointers unchanged (shift_surface preserves Arc for
+            // tile-aligned moves).
+            if let Some(e) = self.fx.get(&key)
+                && e.shape_key == shape_key
             {
-                e.region = region;
-                rebuild = false;
+                let dx = layer_bounds.x0 - e.bounds.x0;
+                let dy = layer_bounds.y0 - e.bounds.y0;
+                if dx == 0 && dy == 0 {
+                    // Position unchanged, but region might have shifted (effect region clamp).
+                    // Just update region.
+                    e.region = region;
+                    rebuild = false;
+                } else if content_src.is_some_and(|c| {
+                    // Verify tile pointer identity for content surface: all tiles shifted
+                    // by (dx/TILE, dy/TILE) still point to the same Arc.
+                    let tile_dx = dx.div_euclid(TILE_SIZE as i32);
+                    let tile_dy = dy.div_euclid(TILE_SIZE as i32);
+                    if tile_dx == 0 && tile_dy == 0 {
+                        return false; // sub-tile move, fallback to rebuild
+                    }
+                    let old_tiles = &e.tiles[0];
+                    if let Some(old) = old_tiles {
+                        old.iter().all(|(c, t)| {
+                            let nc = TileCoord::new(c.tx + tile_dx, c.ty + tile_dy);
+                            content_src.and_then(|s| s.tile(nc)).is_some_and(|nt| Arc::ptr_eq(nt, t))
+                        })
+                    } else {
+                        false
+                    }
+                }) {
+                    // Pure translation: region size unchanged, layer moved by whole tiles.
+                    // GPU textures are in region-local coordinates and don't need translation;
+                    // just update the region and bounds metadata.
+                    rebuild = false;
+                    e.region = region;
+                    e.bounds = layer_bounds;
+                }
             }
         }
         if rebuild {
@@ -1689,6 +1729,7 @@ impl Compositor {
                 FxEntry {
                     doc: doc.id,
                     region,
+                    bounds: layer_bounds,
                     shape_key,
                     tiles: [None, None],
                     _pin: is_group.then(|| layer.clone()),
@@ -1852,7 +1893,8 @@ impl Compositor {
         }
         self.kit.run(device, queue, encoder, &draws);
     }
-}
+
+    
 
 /// A start time when `PHOTOCRAFT_FX_TRACE=1` (it prints the CPU time of effect shapes and
 /// distance fields); never on wasm.
